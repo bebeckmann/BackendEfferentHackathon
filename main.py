@@ -17,7 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from index import index as run_index
+import os, psutil
+
 from retrieve import (
     _get_rag,
     ask as rag_ask,
@@ -207,6 +208,7 @@ async def index_pdfs(files: Annotated[list[UploadFile], File()]):
             pdf_paths.append(dest)
 
         def _run() -> int:
+            from index import index as run_index  # lazy: keeps torch/docling out of startup memory
             return run_index(pdf_paths)
 
         total_chunks = await run_in_threadpool(_run)

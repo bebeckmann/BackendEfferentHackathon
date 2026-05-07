@@ -1,0 +1,10 @@
+.env
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+data/
+qdrant_storage/
+doc_store/
+grounding_output/

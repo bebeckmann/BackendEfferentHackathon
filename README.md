@@ -44,7 +44,7 @@ Single file:
 
 ```bash
 curl -X POST http://localhost:8000/api/index \
-  -F "files=@/path/to/paper.pdf"
+  -F "files=@data/Besen_2016.pdf
 ```
 
 Multiple files:
@@ -79,8 +79,9 @@ curl -X DELETE "http://localhost:8000/api/documents?name=Besen_2016"
 
 ---
 
-### Delete all documents
+### Delete all documents from Vectorstore
 
 ```bash
 curl -X DELETE http://localhost:8000/api/documents/all
 ```
+  
