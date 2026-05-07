@@ -99,22 +99,38 @@ async def chat(
         ],
     )
 
+import base64
+from pathlib import Path
+
+
 @app.get("/api/success-image")
 async def success_image_base64():
-    image_path = STATIC_DIR / "data" / "success.png"
+    image_files = [
+        STATIC_DIR / "data" / "success.png",
+        STATIC_DIR / "data" / "success-2.png",
+    ]
 
-    if not image_path.exists():
-        return {
-            "error": "success.png not found",
-            "path": str(image_path),
-        }
+    images = []
 
-    image_bytes = image_path.read_bytes()
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    for image_path in image_files:
+        if not image_path.exists():
+            return {
+                "error": f"{image_path.name} not found",
+                "path": str(image_path),
+            }
+
+        image_bytes = image_path.read_bytes()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        images.append(
+            {
+                "filename": image_path.name,
+                "mime_type": "image/png",
+                "base64": image_base64,
+                "data_url": f"data:image/png;base64,{image_base64}",
+            }
+        )
 
     return {
-        "filename": "success.png",
-        "mime_type": "image/png",
-        "base64": image_base64,
-        "data_url": f"data:image/png;base64,{image_base64}",
+        "images": images
     }
