@@ -33,7 +33,6 @@ QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 DOC_STORE_DIR = Path("./doc_store")
 EMBED_DIM = 1536
 TOP_K = 3
-OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -154,11 +153,9 @@ def _extract_cited_nums(answer: str) -> set[int]:
 
 def build_chain(vector_store: QdrantVectorStore) -> tuple:
     """Return (retrieval_runnable, llm) for use in ask()."""
-    api_key = os.environ["OPENROUTER_API_KEY"]
     llm = ChatOpenAI(
-        model=os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini"),
-        api_key=api_key,
-        base_url=OPENROUTER_BASE,
+        model=os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+        api_key=os.environ["OPENAI_API_KEY"],
         temperature=0,
     )
     retriever = vector_store.as_retriever(search_kwargs={"k": TOP_K})
@@ -506,11 +503,9 @@ def _get_rag() -> tuple:
     with _rag_lock:
         if _rag_cache:
             return _rag_cache["chain"], _rag_cache["doc_store"]
-        api_key = os.environ["OPENROUTER_API_KEY"]
         embeddings = OpenAIEmbeddings(
-            model=os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small"),
-            api_key=api_key,
-            base_url=OPENROUTER_BASE,
+            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+            api_key=os.environ["OPENAI_API_KEY"],
             dimensions=EMBED_DIM,
         )
         qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -560,11 +555,9 @@ def search_literature(question: str) -> str:
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    api_key = os.environ["OPENROUTER_API_KEY"]
     embeddings = OpenAIEmbeddings(
-        model=os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small"),
-        api_key=api_key,
-        base_url=OPENROUTER_BASE,
+        model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        api_key=os.environ["OPENAI_API_KEY"],
         dimensions=EMBED_DIM,
     )
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)

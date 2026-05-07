@@ -1,17 +1,17 @@
-"""Simple ReAct agent using ChatOpenRouter."""
+"""Simple ReAct agent using ChatOpenAI."""
 from __future__ import annotations
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.middleware import ToolCallLimitMiddleware
-from langchain_openrouter import ChatOpenRouter
+from langchain_openai import ChatOpenAI
 
 from retrieve import search_literature
 
 load_dotenv()
 
-llm = ChatOpenRouter(
-    model="anthropic/claude-sonnet-4.5",
+llm = ChatOpenAI(
+    model="gpt-4o",
     temperature=0,
     max_tokens=4096,
     max_retries=2,

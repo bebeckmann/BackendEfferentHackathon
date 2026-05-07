@@ -33,7 +33,6 @@ QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 DOC_STORE_DIR = Path("./doc_store")
 EMBED_DIM = 1536
-OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 CONTEXT_WINDOW = 3
 
 # ── Logging helper ────────────────────────────────────────────────────────────
@@ -61,19 +60,18 @@ def make_converter() -> DocumentConverter:
         }
     )
 
-# ── OpenRouter client ─────────────────────────────────────────────────────────
+# ── OpenAI client ─────────────────────────────────────────────────────────────
 
-def make_openrouter_client() -> OpenAI:
+def make_openai_client() -> OpenAI:
     return OpenAI(
-        api_key=os.environ["OPENROUTER_API_KEY"],
-        base_url=OPENROUTER_BASE,
+        api_key=os.environ["OPENAI_API_KEY"],
     )
 
 # ── Document summary ──────────────────────────────────────────────────────────
 
 def summarize_document(client: OpenAI, doc: Any) -> str:
     text = doc.export_to_text()
-    model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini")
+    model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
     _log("summarize", f"model={model}  doc_chars={len(text)}  sending={min(len(text), 18_000)}")
 
     response = client.chat.completions.create(
@@ -107,7 +105,7 @@ _METADATA_SCHEMA = (
 def extract_paper_metadata(client: OpenAI, doc: Any) -> dict[str, Any]:
     """Extract structured metadata from document text using a JSON-mode LLM call."""
     text = doc.export_to_text()
-    model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini")
+    model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
     _log("metadata", f"model={model}  sending={min(len(text), 8_000)}")
 
     response = client.chat.completions.create(
@@ -252,7 +250,7 @@ def describe_image(
     else:
         _log("image", "WARNING: no image data — LLM will rely on text context only")
 
-    model = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-4o-mini")
+    model = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
     _log("image", f"calling vision LLM  model={model}  has_image={'yes' if image_b64 else 'no'}")
 
     response = client.chat.completions.create(
@@ -284,14 +282,14 @@ def index(
     doc_store_dir: Path = DOC_STORE_DIR,
     drop_old: bool = False,
 ) -> int:
-    """Convert PDFs, chunk, embed with OpenRouter, and store in Qdrant.
+    """Convert PDFs, chunk, embed with OpenAI, and store in Qdrant.
 
     Images are described by a vision LLM using the document summary and the
     surrounding paragraphs as additional context.
     """
     doc_store_dir.mkdir(parents=True, exist_ok=True)
     converter = make_converter()
-    openrouter = make_openrouter_client()
+    openai_client = make_openai_client()
 
     manifest: dict[str, str] = {}
     lc_docs: list[Document] = []
@@ -316,11 +314,11 @@ def index(
 
         print(flush=True)
         _log("summarize", f"summarizing {source.name}…")
-        doc_summary = summarize_document(openrouter, dl_doc)
+        doc_summary = summarize_document(openai_client, dl_doc)
 
         print(flush=True)
         _log("metadata", f"extracting paper metadata from {source.name}…")
-        paper_meta = extract_paper_metadata(openrouter, dl_doc)
+        paper_meta = extract_paper_metadata(openai_client, dl_doc)
 
         print(flush=True)
         ordered, ref_to_idx = build_context_index(dl_doc)
@@ -343,7 +341,7 @@ def index(
                 print(flush=True)
                 _log("image", f"ref={pic_ref!r}  pages={page_nos}")
                 page_content = describe_image(
-                    client=openrouter,
+                    client=openai_client,
                     picture_item=item,
                     doc=dl_doc,
                     document_summary=doc_summary,
@@ -394,14 +392,12 @@ def index(
 
     print(f"\n{'─'*60}", flush=True)
     _log("embed", f"total chunks to embed: {len(lc_docs)}")
-    embed_model = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    embed_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     _log("embed", f"model={embed_model}  dimensions={EMBED_DIM}")
 
-    api_key = os.environ["OPENROUTER_API_KEY"]
     embeddings = OpenAIEmbeddings(
         model=embed_model,
-        api_key=api_key,
-        base_url=OPENROUTER_BASE,
+        api_key=os.environ["OPENAI_API_KEY"],
         dimensions=EMBED_DIM,
     )
 
