@@ -97,6 +97,49 @@ def summarize_document(client: OpenAI, doc: Any) -> str:
     _log_block("summarize", "result", summary)
     return summary
 
+# ── Title extraction ──────────────────────────────────────────────────────────
+
+def extract_title(client: OpenAI, doc: Any) -> str:
+    """Send the first two page images to the vision LLM and return the paper title."""
+    user_content: list[Any] = [
+        {
+            "type": "text",
+            "text": (
+                "Extract the title of this academic paper from the page image(s). "
+                "Return only the title — no quotes, no explanation."
+            ),
+        }
+    ]
+
+    for page_no in sorted(doc.pages.keys())[:2]:
+        page = doc.pages[page_no]
+        try:
+            pil_image = page.image.pil_image if page.image else None
+        except Exception:
+            pil_image = None
+        if pil_image is None:
+            continue
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+        })
+
+    model = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-4o-mini")
+    _log("title", f"model={model}  page_images={len(user_content) - 1}")
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": user_content}],
+        max_tokens=80,
+    )
+    title = response.choices[0].message.content.strip()
+    _log("title", f"extracted: {title!r}")
+    return title
+
+
 # ── Surrounding-paragraph context ─────────────────────────────────────────────
 
 def build_context_index(doc: Any) -> tuple[list[tuple[str, str]], dict[str, int]]:
@@ -264,6 +307,10 @@ def index(
         doc_summary = summarize_document(openrouter, dl_doc)
 
         print(flush=True)
+        _log("title", f"extracting title from {source.name}…")
+        paper_title = extract_title(openrouter, dl_doc)
+
+        print(flush=True)
         ordered, ref_to_idx = build_context_index(dl_doc)
 
         # self_ref → PictureItem for authoritative get_image() access
@@ -311,7 +358,10 @@ def index(
             lc_docs.append(
                 Document(
                     page_content=page_content,
-                    metadata={"dl_meta": chunk.meta.model_dump(mode="json")},
+                    metadata={
+                        "dl_meta": chunk.meta.model_dump(mode="json"),
+                        "paper_title": paper_title,
+                    },
                 )
             )
 
