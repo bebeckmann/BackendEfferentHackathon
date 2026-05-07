@@ -108,6 +108,8 @@ async def success_image_base64():
     image_files = [
         STATIC_DIR / "data" / "success.png",
         STATIC_DIR / "data" / "success-2.png",
+        STATIC_DIR / "data" / "success.png",
+        STATIC_DIR / "data" / "success-2.png",
     ]
 
     images = []
