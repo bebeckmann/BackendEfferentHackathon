@@ -1,3 +1,4 @@
+import base64
 import os
 from pathlib import Path
 from typing import Annotated
@@ -97,3 +98,23 @@ async def chat(
             "Research-use only. Not for clinical diagnosis, triage, or treatment decisions."
         ],
     )
+
+@app.get("/api/success-image")
+async def success_image_base64():
+    image_path = STATIC_DIR / "data" / "success.png"
+
+    if not image_path.exists():
+        return {
+            "error": "success.png not found",
+            "path": str(image_path),
+        }
+
+    image_bytes = image_path.read_bytes()
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    return {
+        "filename": "success.png",
+        "mime_type": "image/png",
+        "base64": image_base64,
+        "data_url": f"data:image/png;base64,{image_base64}",
+    }
