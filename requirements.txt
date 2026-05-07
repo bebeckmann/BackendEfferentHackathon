@@ -1,0 +1,9 @@
+fastapi[all]
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+langchain
+langchain-openai
+pillow
+python-dotenv

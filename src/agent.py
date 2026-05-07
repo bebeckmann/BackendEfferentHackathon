@@ -4,7 +4,7 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
-
+from pydantic import SecretStr
 
 SYSTEM_PROMPT = """
 You are a research assistant for sepsis analysis.
@@ -75,11 +75,40 @@ def suggest_analysis_plan(question: str) -> str:
 
 
 def build_agent():
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    """
+    Build a LangChain agent using OpenRouter through an OpenAI-compatible endpoint.
+
+    Required environment variables:
+    - OPENROUTER_API_KEY
+    Optional:
+    - OPENROUTER_MODEL, default: openai/gpt-4o-mini
+    - OPENROUTER_SITE_URL
+    - OPENROUTER_APP_NAME
+    """
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENROUTER_API_KEY environment variable.")
+
+    model_name = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+    default_headers = {}
+
+    site_url = os.getenv("OPENROUTER_SITE_URL")
+    app_name = os.getenv("OPENROUTER_APP_NAME", "Sepsis Research Agent")
+
+    if site_url:
+        default_headers["HTTP-Referer"] = site_url
+
+    if app_name:
+        default_headers["X-Title"] = app_name
 
     llm = ChatOpenAI(
         model=model_name,
+        api_key=SecretStr(api_key),
+        base_url="https://openrouter.ai/api/v1",
         temperature=0.2,
+        default_headers=default_headers or None,
     )
 
     return create_agent(
@@ -89,12 +118,21 @@ def build_agent():
     )
 
 
-def build_multimodal_user_message(message: str, uploaded_images: list[dict]) -> dict[str, Any]:
+def build_multimodal_user_message(
+    message: str,
+    uploaded_images: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
     Uses OpenAI-style multimodal content blocks.
     The model receives base64 data URLs.
     The frontend receives normal static URLs in the API response.
+
+    Each image dict should contain:
+    {
+        "data_url": "data:image/png;base64,..."
+    }
     """
+
     content: list[dict[str, Any]] = [
         {
             "type": "text",
@@ -103,11 +141,15 @@ def build_multimodal_user_message(message: str, uploaded_images: list[dict]) -> 
     ]
 
     for image in uploaded_images:
+        data_url = image.get("data_url")
+        if not data_url:
+            continue
+
         content.append(
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": image["data_url"],
+                    "url": data_url,
                 },
             }
         )
@@ -118,7 +160,9 @@ def build_multimodal_user_message(message: str, uploaded_images: list[dict]) -> 
     }
 
 
-async def ask_agent(message: str, uploaded_images: list[dict]) -> str:
+async def ask_agent(message: str, uploaded_images: list[dict[str, Any]] | None = None) -> str:
+    uploaded_images = uploaded_images or []
+
     agent = build_agent()
 
     user_message = build_multimodal_user_message(
@@ -137,17 +181,18 @@ async def ask_agent(message: str, uploaded_images: list[dict]) -> str:
         return "No response was generated."
 
     final_message = messages[-1]
-
     content = getattr(final_message, "content", final_message)
 
     if isinstance(content, str):
         return content
 
     if isinstance(content, list):
-        text_parts = []
+        text_parts: list[str] = []
+
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
+
         return "\n".join(text_parts).strip() or "No text response was generated."
 
     return str(content)
