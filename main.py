@@ -4,18 +4,29 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from retrieve import _get_rag, ask as rag_ask
+from index import index as run_index
+from retrieve import (
+    _get_rag,
+    ask as rag_ask,
+    delete_all_documents,
+    delete_document,
+    find_doc_hash_by_title,
+    invalidate_rag_cache,
+    list_indexed_documents,
+)
 
 load_dotenv()
 
@@ -48,6 +59,20 @@ class AgentResponse(BaseModel):
     answer: str
     images: list[EvidenceImage]
     warnings: list[str]
+
+
+class IndexResponse(BaseModel):
+    indexed: list[str]
+    total_chunks: int
+
+
+class DocumentEntry(BaseModel):
+    doc_hash: str
+    paper_title: str
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentEntry]
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
@@ -121,4 +146,75 @@ async def chat(
         warnings=[
             "Research-use only. Not for clinical diagnosis, triage, or treatment decisions."
         ],
+    )
+
+
+@app.delete("/api/documents/all", status_code=200)
+async def delete_all_documents_endpoint():
+    """Delete every indexed document, all vector chunks, and all doc-store JSON files."""
+    count = await run_in_threadpool(delete_all_documents)
+    invalidate_rag_cache()
+    return {"deleted": count}
+
+
+@app.get("/api/documents", response_model=DocumentListResponse)
+async def list_documents():
+    """List all indexed PDFs with their doc hash (UUID) and paper title."""
+    docs = await run_in_threadpool(list_indexed_documents)
+    return DocumentListResponse(documents=[DocumentEntry(**d) for d in docs])
+
+
+@app.delete("/api/documents", status_code=200)
+async def delete_document_endpoint(
+    doc_hash: Annotated[str | None, Query()] = None,
+    name: Annotated[str | None, Query()] = None,
+):
+    """Delete a document and all its vector chunks by doc_hash or paper title."""
+    if not doc_hash and not name:
+        raise HTTPException(status_code=422, detail="Provide either 'doc_hash' or 'name'.")
+    if doc_hash and name:
+        raise HTTPException(status_code=422, detail="Provide only one of 'doc_hash' or 'name', not both.")
+
+    resolved_hash = doc_hash
+    if name and not resolved_hash:
+        resolved_hash = await run_in_threadpool(find_doc_hash_by_title, name)
+        if not resolved_hash:
+            raise HTTPException(status_code=404, detail=f"No document found with name {name!r}.")
+
+    deleted = await run_in_threadpool(delete_document, resolved_hash)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No document found with doc_hash {resolved_hash!r}.")
+
+    invalidate_rag_cache()
+    return {"deleted": resolved_hash}
+
+
+@app.post("/api/index", response_model=IndexResponse)
+async def index_pdfs(files: Annotated[list[UploadFile], File()]):
+    """Upload one or more PDFs and add them to the vector store."""
+    if not files:
+        raise HTTPException(status_code=422, detail="No files provided.")
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        pdf_paths: list[Path] = []
+        for upload in files:
+            if not (upload.filename or "").lower().endswith(".pdf"):
+                raise HTTPException(status_code=422, detail=f"{upload.filename!r} is not a PDF.")
+            dest = Path(tmp_dir) / upload.filename
+            with dest.open("wb") as fh:
+                shutil.copyfileobj(upload.file, fh)
+            pdf_paths.append(dest)
+
+        def _run() -> int:
+            return run_index(pdf_paths)
+
+        total_chunks = await run_in_threadpool(_run)
+        invalidate_rag_cache()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return IndexResponse(
+        indexed=[p.name for p in pdf_paths],
+        total_chunks=total_chunks,
     )

@@ -29,7 +29,8 @@ SOURCES = [
     Path("data/Besen_2016.pdf"),
 ]
 COLLECTION = "visual_grounding"
-QDRANT_PATH = "./qdrant_storage"
+QDRANT_URL = os.environ["QDRANT_URL"]
+QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 DOC_STORE_DIR = Path("./doc_store")
 EMBED_DIM = 1536
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
@@ -280,10 +281,9 @@ def index(
     sources: list[Path],
     *,
     collection: str = COLLECTION,
-    qdrant_path: str = QDRANT_PATH,
     doc_store_dir: Path = DOC_STORE_DIR,
     drop_old: bool = False,
-) -> None:
+) -> int:
     """Convert PDFs, chunk, embed with OpenRouter, and store in Qdrant.
 
     Images are described by a vision LLM using the document summary and the
@@ -385,6 +385,10 @@ def index(
         _log("chunk", f"total={text_count + image_count}  text={text_count}  image={image_count}")
 
     manifest_path = doc_store_dir / "manifest.json"
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text())
+        existing.update(manifest)
+        manifest = existing
     manifest_path.write_text(json.dumps(manifest, indent=2))
     _log("manifest", f"saved → {manifest_path}  entries={len(manifest)}")
 
@@ -401,7 +405,7 @@ def index(
         dimensions=EMBED_DIM,
     )
 
-    client = QdrantClient(path=qdrant_path)
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
     if drop_old:
         try:
@@ -425,10 +429,11 @@ def index(
         embedding=embeddings,
     )
     vector_store.add_documents(lc_docs)
-    _log("qdrant", f"stored {len(lc_docs)} documents in '{collection}' at {qdrant_path}")
+    _log("qdrant", f"stored {len(lc_docs)} documents in '{collection}' at {QDRANT_URL}")
 
     print(f"\n{'─'*60}", flush=True)
     print("  Done.", flush=True)
+    return len(lc_docs)
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────

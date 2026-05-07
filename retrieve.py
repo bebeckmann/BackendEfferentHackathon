@@ -1,6 +1,7 @@
 """Retrieval — load Qdrant index, run RAG queries with visual grounding."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -20,13 +21,15 @@ from langchain_core.runnables import RunnableParallel
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, FieldCondition, Filter, FilterSelector, MatchValue, VectorParams
 
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 COLLECTION = "visual_grounding"
-QDRANT_PATH = "./qdrant_storage"
+QDRANT_URL = os.environ["QDRANT_URL"]
+QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 DOC_STORE_DIR = Path("./doc_store")
 EMBED_DIM = 1536
 TOP_K = 3
@@ -369,6 +372,133 @@ def pop_last_images() -> list:
         return _images_by_thread.pop(tid, [])
 
 
+def list_indexed_documents() -> list[dict]:
+    """Return [{doc_hash, paper_title}] for every entry in the manifest."""
+    manifest_path = DOC_STORE_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    manifest: dict[str, str] = json.loads(manifest_path.read_text())
+    if not manifest:
+        return []
+
+    titles: dict[str, str] = {}
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    try:
+        collections = {c.name for c in client.get_collections().collections}
+        if COLLECTION in collections:
+            offset = None
+            while True:
+                results, offset = client.scroll(
+                    collection_name=COLLECTION,
+                    with_payload=True,
+                    limit=100,
+                    offset=offset,
+                )
+                for point in results:
+                    meta = (point.payload or {}).get("metadata", {})
+                    dh = meta.get("doc_hash", "")
+                    title = meta.get("paper_title", "")
+                    if dh and dh not in titles:
+                        titles[dh] = title
+                if offset is None:
+                    break
+    finally:
+        client.close()
+
+    return [
+        {"doc_hash": dh, "paper_title": titles.get(dh, "")}
+        for dh in manifest
+    ]
+
+
+def find_doc_hash_by_title(title: str) -> str | None:
+    """Return the doc_hash whose paper_title matches (case-insensitive), or None."""
+    title_lower = title.lower()
+    for doc in list_indexed_documents():
+        if doc["paper_title"].lower() == title_lower:
+            return doc["doc_hash"]
+    return None
+
+
+def delete_document(doc_hash: str) -> bool:
+    """Delete all Qdrant chunks, the doc-store JSON, and the manifest entry for doc_hash.
+
+    Returns True when the document existed and was removed, False when not found.
+    """
+    manifest_path = DOC_STORE_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return False
+
+    manifest: dict[str, str] = json.loads(manifest_path.read_text())
+    if doc_hash not in manifest:
+        return False
+
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    try:
+        collections = {c.name for c in client.get_collections().collections}
+        if COLLECTION in collections:
+            client.delete(
+                collection_name=COLLECTION,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[FieldCondition(key="metadata.doc_hash", match=MatchValue(value=doc_hash))]
+                    )
+                ),
+            )
+    finally:
+        client.close()
+
+    json_path = Path(manifest[doc_hash])
+    if json_path.exists():
+        json_path.unlink()
+
+    del manifest[doc_hash]
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    return True
+
+
+def delete_all_documents() -> int:
+    """Delete every document: drop and recreate the Qdrant collection, remove all
+    doc-store JSON files, and reset the manifest.
+
+    Returns the number of documents that were removed.
+    """
+    manifest_path = DOC_STORE_DIR / "manifest.json"
+    manifest: dict[str, str] = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+
+    count = len(manifest)
+
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    try:
+        existing = {c.name for c in client.get_collections().collections}
+        if COLLECTION in existing:
+            client.delete_collection(COLLECTION)
+        client.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+    finally:
+        client.close()
+
+    for json_path_str in manifest.values():
+        json_path = Path(json_path_str)
+        if json_path.exists():
+            json_path.unlink()
+
+    manifest_path.write_text(json.dumps({}, indent=2))
+
+    return count
+
+
+def invalidate_rag_cache() -> None:
+    """Clear the RAG cache so the next call to _get_rag() reloads from disk."""
+    with _rag_lock:
+        _rag_cache.clear()
+
+
 def _get_rag() -> tuple:
     """Lazily initialise and cache the RAG chain + doc store."""
     if _rag_cache:
@@ -383,7 +513,13 @@ def _get_rag() -> tuple:
             base_url=OPENROUTER_BASE,
             dimensions=EMBED_DIM,
         )
-        qdrant = QdrantClient(path=QDRANT_PATH)
+        qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        existing = {c.name for c in qdrant.get_collections().collections}
+        if COLLECTION not in existing:
+            qdrant.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            )
         vector_store = QdrantVectorStore(
             client=qdrant,
             collection_name=COLLECTION,
@@ -431,7 +567,7 @@ if __name__ == "__main__":
         base_url=OPENROUTER_BASE,
         dimensions=EMBED_DIM,
     )
-    client = QdrantClient(path=QDRANT_PATH)
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     vector_store = QdrantVectorStore(
         client=client,
         collection_name=COLLECTION,
