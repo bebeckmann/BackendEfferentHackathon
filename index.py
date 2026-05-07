@@ -5,9 +5,10 @@ import base64
 import io
 import json
 import os
+import re
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -15,9 +16,10 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import DocItemLabel, ImageRefMode
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from openai import OpenAI
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
@@ -44,6 +46,24 @@ def _log_block(tag: str, label: str, text: str, max_chars: int = 400) -> None:
     preview = text[:max_chars] + ("…" if len(text) > max_chars else "")
     indented = textwrap.indent(preview, "    │ ")
     print(f"  [{tag}] {label}:\n{indented}", flush=True)
+
+# ── Title extraction ─────────────────────────────────────────────────────────
+
+def _extract_doc_title(dl_doc: Any, fallback: str) -> str:
+    """Extract the paper title directly from the docling document structure."""
+    for item, _ in dl_doc.iterate_items():
+        label = getattr(item, "label", None)
+        label_val = getattr(label, "value", "") if label else ""
+        text = (getattr(item, "text", "") or "").strip()
+        if label_val == "title" and text:
+            return text
+    for item, _ in dl_doc.iterate_items():
+        label = getattr(item, "label", None)
+        label_val = getattr(label, "value", "") if label else ""
+        text = (getattr(item, "text", "") or "").strip()
+        if label_val == "section_header" and len(text) > 20:
+            return text
+    return fallback
 
 # ── Document Converter ────────────────────────────────────────────────────────
 
@@ -151,6 +171,103 @@ def extract_paper_metadata(client: OpenAI, doc: Any) -> dict[str, Any]:
     return result
 
 
+# ── Study-field extraction → index.md ────────────────────────────────────────
+
+class StudyEntry(BaseModel):
+    """One predictor/comparison evaluated in the paper."""
+    study_title: str = Field(description="Full study title")
+    authors: str = Field(description="Authors separated by semicolons")
+    year: Optional[int] = Field(default=None, description="Publication year as integer")
+    journal: str = Field(description="Journal name")
+    doi: str = Field(description="DOI string, e.g. 10.xxxx/xxxxx")
+    keywords: str = Field(description="Keywords separated by semicolons")
+    population: str = Field(description="Study population and setting")
+    sample_size: str = Field(description="Sample size, e.g. N=286 total; N=163 non-survivors; N=123 survivors")
+    predictor: str = Field(description="The predictor score or variable being evaluated, including full name and abbreviation")
+    outcome: str = Field(description="Primary outcome measured, e.g. 30-day mortality")
+    timing: str = Field(description="When the predictor was measured relative to admission or event")
+    method: str = Field(description="Statistical methods: study design, ROC analysis, tests used")
+    effect_size: str = Field(description="Cutoffs, medians with p-values, or other effect size measures")
+    performance: str = Field(description="AUC with CI, sensitivity, specificity, PPV, NPV, accuracy")
+    notes: str = Field(description="Comparison notes or caveats relative to other predictors in the paper")
+    summary: str = Field(description="One- or two-sentence clinical summary of findings for this predictor")
+    source: str = Field(description="Section(s) and page numbers where data were found")
+
+
+def extract_study_fields(markdown_text: str) -> StudyEntry:
+    """LangChain structured-output call that extracts exactly one study entry per document."""
+    model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+    _log("study-fields", f"model={model}  md_chars={len(markdown_text)}  sending={min(len(markdown_text), 15_000)}")
+
+    llm = ChatOpenAI(
+        model=model,
+        temperature=0,
+        api_key=os.environ["OPENAI_API_KEY"],
+    )
+    structured_llm = llm.with_structured_output(StudyEntry)
+
+    prompt = (
+        "You are a medical-literature analyst. "
+        "Extract a single summary entry for the research paper below. "
+        "If the paper evaluates multiple predictors, list them all in the Predictor field "
+        "and combine their performance metrics in the Performance field. "
+        "Use null for missing numeric fields. Authors and keywords must be semicolon-separated strings.\n\n"
+        f"---PAPER START---\n{markdown_text[:15_000]}\n---PAPER END---"
+    )
+
+    entry: StudyEntry = structured_llm.invoke(prompt)
+    _log("study-fields", f"extracted entry doi={entry.doi!r}")
+    return entry
+
+
+def _format_study_entry(entry: StudyEntry) -> str:
+    return (
+        f"**Study Title:** {entry.study_title}  \n"
+        f"**Authors:** {entry.authors}  \n"
+        f"**Year:** {entry.year}  \n"
+        f"**Journal:** {entry.journal}  \n"
+        f"**Doi:** {entry.doi}  \n"
+        f"**Keywords:** {entry.keywords}  \n"
+        f"**Population:** {entry.population}  \n"
+        f"**Sample Size:** {entry.sample_size}  \n"
+        f"**Predictor:** {entry.predictor}  \n"
+        f"**Outcome:** {entry.outcome}  \n"
+        f"**Timing:** {entry.timing}  \n"
+        f"**Method:** {entry.method}  \n"
+        f"**Effect Size:** {entry.effect_size}  \n"
+        f"**Performance:** {entry.performance}  \n"
+        f"**Notes:** {entry.notes}  \n"
+        f"**Summary:** {entry.summary}  \n"
+        f"**Source:** {entry.source}  \n"
+        "\n---\n\n"
+    )
+
+
+def _existing_dois(index_path: Path) -> set[str]:
+    """Return DOIs already recorded in index.md."""
+    if not index_path.exists():
+        return set()
+    return {
+        line.removeprefix("**Doi:**").strip().rstrip("  ")
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("**Doi:**")
+    }
+
+
+def append_to_index_md(entry: StudyEntry, index_path: Path) -> None:
+    """Append one study entry to index.md; skip if DOI already present."""
+    if not index_path.exists():
+        index_path.write_text("# Study Index\n\n", encoding="utf-8")
+
+    if entry.doi and entry.doi in _existing_dois(index_path):
+        _log("index-md", f"doi={entry.doi!r} already present — skipping")
+        return
+
+    with index_path.open("a", encoding="utf-8") as f:
+        f.write(_format_study_entry(entry))
+    _log("index-md", f"appended entry doi={entry.doi!r} → {index_path}")
+
+
 # ── Surrounding-paragraph context ─────────────────────────────────────────────
 
 def build_context_index(doc: Any) -> tuple[list[tuple[str, str]], dict[str, int]]:
@@ -226,22 +343,12 @@ def describe_image(
         caption = str(cap).strip() if cap else ""
     _log("image", f"caption={'yes (' + caption[:60] + ')' if caption else 'none'}")
 
-    _log_block("image", "document_summary (sent to LLM)", document_summary)
-    _log_block("image", "surrounding context (sent to LLM)", context or "[none]")
+    user_content: list[Any] = []
+    if caption:
+        user_content.append({"type": "text", "text": f"Caption: {caption}\n\nDescribe only what is visually shown in this image."})
+    else:
+        user_content.append({"type": "text", "text": "Describe only what is visually shown in this image."})
 
-    user_content: list[Any] = [
-        {
-            "type": "text",
-            "text": (
-                f"Document summary:\n{document_summary}\n\n"
-                f"Surrounding paragraphs:\n{context or '[none]'}\n\n"
-                f"Caption: {caption or '[none]'}\n\n"
-                "Describe this image for retrieval indexing. Include what it depicts, "
-                "key terms from the surrounding context, and any visible labels or data. "
-                "Do not invent values not supported by the provided text."
-            ),
-        }
-    ]
     if image_b64:
         user_content.append({
             "type": "image_url",
@@ -259,8 +366,9 @@ def describe_image(
             {
                 "role": "system",
                 "content": (
-                    "You are preparing a PDF image element for vector retrieval. "
-                    "Write a concise, retrieval-friendly description."
+                    "You describe images exactly as they appear visually. "
+                    "Do not reference any surrounding text, paper context, or external knowledge. "
+                    "Only describe what is directly visible in the image."
                 ),
             },
             {"role": "user", "content": user_content},
@@ -320,12 +428,17 @@ def index(
         _log("metadata", f"extracting paper metadata from {source.name}…")
         paper_meta = extract_paper_metadata(openai_client, dl_doc)
 
+        doc_title = _extract_doc_title(dl_doc, doc_hash)
+        safe_title = re.sub(r'[\\/:*?"<>|]', '', doc_title).strip()
+        md_path = doc_store_dir / f"{safe_title}.md"
+
         print(flush=True)
         ordered, ref_to_idx = build_context_index(dl_doc)
 
         print(flush=True)
         current_heading: str | None = None
         text_count = image_count = 0
+        image_descriptions: list[str] = []
 
         for item, _ in dl_doc.iterate_items():
             label = getattr(item, "label", None)
@@ -347,6 +460,7 @@ def index(
                     document_summary=doc_summary,
                     context=context,
                 )
+                image_descriptions.append(page_content)
                 image_count += 1
             else:
                 text = getattr(item, "text", "") or ""
@@ -376,11 +490,24 @@ def index(
                         "page_nos": page_nos,
                         "self_ref": getattr(item, "self_ref", ""),
                         "doc_hash": str(dl_doc.origin.binary_hash),
+                        "md_file":  md_path.name,
                     },
                 )
             )
 
         _log("chunk", f"total={text_count + image_count}  text={text_count}  image={image_count}")
+
+        md_text = dl_doc.export_to_markdown()
+        for desc in image_descriptions:
+            md_text = md_text.replace("<!-- image -->", f"> {desc}\n", 1)
+        md_path.write_text(md_text, encoding="utf-8")
+        _log("convert", f"doc Markdown saved → {md_path}  images_injected={len(image_descriptions)}")
+
+        print(flush=True)
+        _log("study-fields", f"extracting structured study fields from {md_path.name}…")
+        study_entry = extract_study_fields(md_text)
+        index_md_path = doc_store_dir / "index.md"
+        append_to_index_md(study_entry, index_md_path)
 
     manifest_path = doc_store_dir / "manifest.json"
     if manifest_path.exists():
@@ -430,6 +557,18 @@ def index(
     print(f"\n{'─'*60}", flush=True)
     print("  Done.", flush=True)
     return len(lc_docs)
+
+
+# ── Index-md reader ──────────────────────────────────────────────────────────
+
+def read_index_entries(index_path: Path = DOC_STORE_DIR / "index.md") -> list[str]:
+    """Return each study entry from index.md as a markdown string (1 per PDF)."""
+    if not index_path.exists():
+        return []
+    content = index_path.read_text(encoding="utf-8")
+    content = re.sub(r"^#[^\n]*\n+", "", content)  # strip header line
+    entries = [e.strip() for e in content.split("\n---\n")]
+    return [e for e in entries if e]
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────

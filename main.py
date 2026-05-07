@@ -6,6 +6,7 @@ import io
 import os
 import shutil
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -17,15 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from index import index as run_index
+from agent import agent
+from index import index as run_index, read_index_entries
 from retrieve import (
     _get_rag,
-    ask as rag_ask,
     delete_all_documents,
     delete_document,
     find_doc_hash_by_title,
     invalidate_rag_cache,
     list_indexed_documents,
+    pop_last_images,
 )
 
 load_dotenv()
@@ -49,7 +51,7 @@ class HealthResponse(BaseModel):
 
 
 class EvidenceImage(BaseModel):
-    url: str
+    data: str   # base64-encoded PNG as a data URI
     caption: str
     source: str
     kind: str  # "grounding" | "uploaded"
@@ -73,6 +75,12 @@ class DocumentEntry(BaseModel):
 
 class DocumentListResponse(BaseModel):
     documents: list[DocumentEntry]
+
+
+class IndexEntryResponse(BaseModel):
+    number: int
+    total: int
+    entry: str
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
@@ -117,25 +125,32 @@ async def chat(
     """
     _ = session_id, images  # accepted for API compatibility, unused by RAG pipeline
 
+    thread_id = session_id or str(uuid.uuid4())
+
     def _run(question: str):
-        chain, doc_store = _get_rag()
-        return rag_ask(question, chain, doc_store)
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": question}]},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        answer = result["messages"][-1].content
+        grounding_images = pop_last_images()  # set by search_literature if called
+        return answer, grounding_images
 
     try:
-        answer, grounding_images, cited_chunks = await run_in_threadpool(_run, message)
+        answer, grounding_images = await run_in_threadpool(_run, message)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     evidence: list[EvidenceImage] = []
-    for img, chunk in zip(grounding_images, cited_chunks):
+    for i, img in enumerate(grounding_images, start=1):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
         evidence.append(
             EvidenceImage(
-                url=f"data:image/png;base64,{b64}",
-                caption=f"[{chunk.num}] {chunk.pdf_name} — page {chunk.page_no}",
-                source=chunk.pdf_name,
+                data=f"data:image/png;base64,{b64}",
+                caption=f"Source {i}",
+                source="literature",
                 kind="grounding",
             )
         )
@@ -187,6 +202,27 @@ async def delete_document_endpoint(
 
     invalidate_rag_cache()
     return {"deleted": resolved_hash}
+
+
+@app.get("/api/index/entries")
+async def get_full_index():
+    """Return the entire index.md file as a markdown string."""
+    entries = await run_in_threadpool(read_index_entries)
+    if not entries:
+        raise HTTPException(status_code=404, detail="index.md is empty or does not exist.")
+    return {"total": len(entries), "content": "\n\n---\n\n".join(entries)}
+
+
+@app.get("/api/index/entries/{number}", response_model=IndexEntryResponse)
+async def get_index_entry(number: int):
+    """Return the study entry at position *number* (1-based) and the total entry count."""
+    entries = await run_in_threadpool(read_index_entries)
+    total = len(entries)
+    if total == 0:
+        raise HTTPException(status_code=404, detail="index.md is empty or does not exist.")
+    if number < 1 or number > total:
+        raise HTTPException(status_code=404, detail=f"Entry {number} not found. Index contains {total} entries.")
+    return IndexEntryResponse(number=number, total=total, entry=entries[number - 1])
 
 
 @app.post("/api/index", response_model=IndexResponse)

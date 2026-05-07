@@ -5,7 +5,7 @@ RAG pipeline for querying indexed sepsis research papers, exposed as a FastAPI H
 ## Setup
 
 ```bash
-cp .env.example .env  # fill in OPENROUTER_API_KEY, QDRANT_URL, QDRANT_API_KEY
+cp .env.example .env  # fill in OPENAI_API_KEY, QDRANT_URL, QDRANT_API_KEY
 pip install -r requirements.txt
 ```
 
@@ -31,9 +31,23 @@ curl http://localhost:8000/health
 
 ### Chat (RAG query)
 
+Basic query:
+
 ```bash
 curl -X POST http://localhost:8000/api/chat \
-  -F "message=What are the diagnostic criteria for sepsis?"
+  -F "message=Why was it important to test Sepsis-3 definitions outside high-income countries?"
+```
+
+With session ID (maintains conversation memory across turns):
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -F "message=What is the main finding?" \
+  -F "session_id=my-session-123"
+
+curl -X POST http://localhost:8000/api/chat \
+  -F "message=Which paper was that from?" \
+  -F "session_id=my-session-123"
 ```
 
 ---
@@ -44,15 +58,15 @@ Single file:
 
 ```bash
 curl -X POST http://localhost:8000/api/index \
-  -F "files=@/path/to/paper.pdf"
+  -F "files=@data/Besen_2016.pdf"
 ```
 
 Multiple files:
 
 ```bash
 curl -X POST http://localhost:8000/api/index \
-  -F "files=@paper1.pdf" \
-  -F "files=@paper2.pdf"
+  -F "files=@data/Besen_2016.pdf" \
+  -F "files=@data/Li_2020.pdf"
 ```
 
 ---
@@ -83,4 +97,20 @@ curl -X DELETE "http://localhost:8000/api/documents?name=Besen_2016"
 
 ```bash
 curl -X DELETE http://localhost:8000/api/documents/all
+```
+
+---
+
+### Study index
+
+Get the full index (all papers):
+
+```bash
+curl http://localhost:8000/api/index/entries
+```
+
+Get a specific entry by number (1-based):
+
+```bash
+curl http://localhost:8000/api/index/entries/1
 ```

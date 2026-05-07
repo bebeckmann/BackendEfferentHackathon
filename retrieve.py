@@ -64,9 +64,7 @@ def load_doc_store(doc_store_dir: Path = DOC_STORE_DIR) -> dict[str, Path]:
     """Load the binary_hash → json_path mapping written by index.py."""
     manifest_path = doc_store_dir / "manifest.json"
     if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"No manifest found at {manifest_path}. Run index.py first."
-        )
+        return {}
     raw = json.loads(manifest_path.read_text())
     return {k: Path(v) for k, v in raw.items()}
 
@@ -172,15 +170,46 @@ def _pil_from_page_image(page_image) -> Image.Image | None:
     """Return a PIL image from a Docling PageItem.image, decoding base64 if needed."""
     if page_image is None:
         return None
-    if page_image.pil_image is not None:
+    if getattr(page_image, "pil_image", None) is not None:
         return page_image.pil_image
-    uri = str(page_image.uri) if getattr(page_image, "uri", None) else None
-    if uri and uri.startswith("data:"):
+    uri_obj = getattr(page_image, "uri", None)
+    if uri_obj is None:
+        return None
+    uri = str(uri_obj)
+    print(f"  [grounding] page_image.uri type={type(uri_obj).__name__}  starts_with_data={uri.startswith('data:')}")
+    if uri.startswith("data:"):
         try:
             _, b64_data = uri.split(",", 1)
             return Image.open(io.BytesIO(_base64.b64decode(b64_data)))
-        except Exception:
+        except Exception as exc:
+            print(f"  [grounding] base64 decode failed: {exc}")
+    return None
+
+
+def _load_page_image_from_json(json_path: Path, page_no: int) -> Image.Image | None:
+    """Directly parse the Docling JSON to extract the embedded page image.
+
+    This bypasses Docling/Pydantic deserialization, which may silently drop
+    data: URIs during validation.
+    """
+    try:
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+        pages = raw.get("pages", {})
+        page_data = pages.get(str(page_no)) or pages.get(page_no)
+        if not page_data:
+            print(f"  [grounding] page_no={page_no} not found in JSON keys: {list(pages.keys())[:5]}")
             return None
+        image_data = page_data.get("image") or {}
+        uri = image_data.get("uri", "") if isinstance(image_data, dict) else ""
+        if not uri:
+            print(f"  [grounding] no uri in page image JSON")
+            return None
+        print(f"  [grounding] raw JSON uri prefix: {uri[:60]}")
+        if uri.startswith("data:"):
+            _, b64 = uri.split(",", 1)
+            return Image.open(io.BytesIO(_base64.b64decode(b64)))
+    except Exception as exc:
+        print(f"  [grounding] _load_page_image_from_json failed: {exc}")
     return None
 
 
@@ -250,15 +279,28 @@ def highlight_sources(
     annotated: list[Image.Image] = []
 
     for (doc_hash, page_no), num_provs in page_entries.items():
-        if doc_hash not in doc_store:
-            continue
-        if doc_hash not in dl_docs:
-            dl_docs[doc_hash] = DoclingDocument.load_from_json(doc_store[doc_hash])
+        try:
+            if doc_hash not in doc_store:
+                print(f"  [grounding] doc_hash {doc_hash!r} NOT in doc_store — skipping")
+                continue
+            if doc_hash not in dl_docs:
+                dl_docs[doc_hash] = DoclingDocument.load_from_json(doc_store[doc_hash])
 
-        page = dl_docs[doc_hash].pages[page_no]
-        pil_img = _pil_from_page_image(page.image)
-        if pil_img is None:
-            print(f"  [grounding] no image data for page {page_no} in {doc_hash}")
+            pages_keys = list(dl_docs[doc_hash].pages.keys())
+            print(f"  [grounding] pages keys={pages_keys}  looking for page_no={page_no} (type={type(page_no).__name__})")
+            page = dl_docs[doc_hash].pages[page_no]
+            print(f"  [grounding] page.image={page.image!r}")
+            pil_img = _pil_from_page_image(page.image)
+            if pil_img is None:
+                print(f"  [grounding] pil_from_page_image returned None, trying raw JSON fallback")
+                pil_img = _load_page_image_from_json(doc_store[doc_hash], page_no)
+            if pil_img is None:
+                print(f"  [grounding] no image data for page {page_no} in {doc_hash}")
+                continue
+        except Exception as exc:
+            import traceback
+            print(f"  [grounding] EXCEPTION in rendering loop: {exc}")
+            traceback.print_exc()
             continue
         img = pil_img.copy()
         draw = ImageDraw.Draw(img)
@@ -356,17 +398,20 @@ from langchain_core.tools import tool  # noqa: E402
 _rag_cache: dict = {}
 _rag_lock = threading.Lock()
 
-# Images produced by the most recent search_literature call, keyed by thread id
-# so concurrent requests don't overwrite each other.
-_images_by_thread: dict[int, list] = {}
-_images_dict_lock = threading.Lock()
+# Images produced by the most recent search_literature call.
+# Using a Queue avoids thread-ID mismatches: the LangGraph agent may execute
+# tools in a different thread (or async event loop) than the caller of
+# pop_last_images(), so keying by threading.get_ident() is unreliable.
+import queue as _queue
+_images_queue: _queue.Queue = _queue.Queue()
 
 
 def pop_last_images() -> list:
-    """Retrieve and clear images stored for the calling thread."""
-    tid = threading.get_ident()
-    with _images_dict_lock:
-        return _images_by_thread.pop(tid, [])
+    """Retrieve and clear images from the most recent search_literature call."""
+    try:
+        return _images_queue.get_nowait()
+    except _queue.Empty:
+        return []
 
 
 def list_indexed_documents() -> list[dict]:
@@ -448,6 +493,12 @@ def delete_document(doc_hash: str) -> bool:
     json_path = Path(manifest[doc_hash])
     if json_path.exists():
         json_path.unlink()
+    for md_path in json_path.parent.glob("*.md"):
+        # remove any .md whose stem matches the json stem (uuid fallback) or
+        # that was written for this document (we can't know the title here, so
+        # remove all .md files that share the same parent and doc_hash stem)
+        if md_path.stem == json_path.stem:
+            md_path.unlink()
 
     del manifest[doc_hash]
     manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -484,6 +535,9 @@ def delete_all_documents() -> int:
         json_path = Path(json_path_str)
         if json_path.exists():
             json_path.unlink()
+
+    for md_path in DOC_STORE_DIR.glob("*.md"):
+        md_path.unlink()
 
     manifest_path.write_text(json.dumps({}, indent=2))
 
@@ -537,9 +591,7 @@ def search_literature(question: str) -> str:
     answer, images, cited_chunks = ask(question, chain, doc_store)
 
     # Store images so the API layer can retrieve them after the agent finishes.
-    tid = threading.get_ident()
-    with _images_dict_lock:
-        _images_by_thread[tid] = list(images)
+    _images_queue.put(list(images))
 
     cited_nums = {int(m) for m in re.findall(r"\[(\d+)\]", answer)}
     sources = "\n".join(
@@ -550,6 +602,35 @@ def search_literature(question: str) -> str:
         if cc.num in cited_nums
     )
     return f"{answer}\n\n---\n**Sources**\n\n{sources}"
+
+
+@tool
+def get_paper_markdown(paper_name: str) -> str:
+    """Return the entire content of a paper as markdown text, given the paper title or a close approximation.
+
+    Use this tool if you want to go deep on a specific paper, read its full content, or extract information that may not have been included in the retrieved chunks. Input should be the exact paper title or a close approximation to it.
+
+    Input should be the paper title or a close approximation.
+    """
+    md_files = list(DOC_STORE_DIR.glob("*.md"))
+    if not md_files:
+        return "No markdown files found in the document store."
+
+    needle = paper_name.lower()
+    best: Path | None = None
+    best_score = -1
+    for path in md_files:
+        stem = path.stem.replace("_", " ").lower()
+        # score by how many words from the query appear in the filename
+        score = sum(1 for word in needle.split() if word in stem)
+        if score > best_score:
+            best_score, best = score, path
+
+    if best is None or best_score == 0:
+        available = ", ".join(p.stem.replace("_", " ") for p in md_files)
+        return f"No matching paper found for '{paper_name}'. Available papers: {available}"
+
+    return best.read_text(encoding="utf-8")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
