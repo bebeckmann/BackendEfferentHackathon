@@ -9,9 +9,7 @@ from operator import itemgetter
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
-from docling.chunking import DocMeta
 from docling.datamodel.document import DoclingDocument
-from docling_core.types.doc import DocItemLabel
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -73,32 +71,43 @@ def load_doc_store(doc_store_dir: Path = DOC_STORE_DIR) -> dict[str, Path]:
 def _sort_and_number_chunks(docs: list[Document]) -> list[CitedChunk]:
     """Sort retrieved docs by (pdf_name, page_no) and assign citation numbers."""
     def _key(doc: Document) -> tuple[str, int]:
-        meta = DocMeta.model_validate(doc.metadata["dl_meta"])
-        name = Path(meta.origin.filename or str(meta.origin.binary_hash)).name
-        pages = [p.page_no for di in meta.doc_items for p in (di.prov or [])]
-        return (name, min(pages, default=0))
+        m = doc.metadata
+        name = m.get("paper_title") or m.get("doc_hash", "")
+        return (name, min(m.get("page_nos", [0]), default=0))
 
     result: list[CitedChunk] = []
     for i, doc in enumerate(sorted(docs, key=_key), start=1):
-        meta = DocMeta.model_validate(doc.metadata["dl_meta"])
-        pdf_name = Path(meta.origin.filename or str(meta.origin.binary_hash)).name
-        pages = [p.page_no for di in meta.doc_items for p in (di.prov or [])]
+        m = doc.metadata
         result.append(CitedChunk(
             num=i,
-            pdf_name=pdf_name,
-            page_no=min(pages, default=0),
-            doc_hash=str(meta.origin.binary_hash),
+            pdf_name=m.get("paper_title") or m.get("doc_hash", "unknown"),
+            page_no=min(m.get("page_nos", [0]), default=0),
+            doc_hash=str(m.get("doc_hash", "")),
             lc_doc=doc,
-            is_image=any(
-                getattr(di, "label", None) == DocItemLabel.PICTURE
-                for di in meta.doc_items
-            ),
-            docling_id=meta.doc_items[0].self_ref if meta.doc_items else "unknown",
+            is_image=m.get("label") == "picture",
+            docling_id=m.get("self_ref", "unknown"),
         ))
     return result
 
 
 # ── Context markdown builder ──────────────────────────────────────────────────
+
+def _paper_meta_block(meta: dict) -> str:
+    """Format paper-level metadata as a markdown definition list."""
+    fields: list[tuple[str, str]] = [
+        ("Title",         meta.get("paper_title", "")),
+        ("Authors",       ", ".join(meta.get("paper_authors", []) or [])),
+        ("Year",          str(meta.get("paper_year", "")) if meta.get("paper_year") else ""),
+        ("Journal",       meta.get("paper_journal", "")),
+        ("DOI",           meta.get("paper_doi", "")),
+        ("Language",      meta.get("paper_language", "")),
+        ("Document type", meta.get("paper_document_type", "")),
+        ("Keywords",      ", ".join(meta.get("paper_keywords", []) or [])),
+        ("Abstract",      meta.get("paper_abstract", "")),
+    ]
+    rows = "\n".join(f"**{k}:** {v}" for k, v in fields if v)
+    return rows
+
 
 def _build_context_markdown(cited_chunks: list[CitedChunk]) -> str:
     """Build structured markdown context for the LLM with citation numbers."""
@@ -106,11 +115,16 @@ def _build_context_markdown(cited_chunks: list[CitedChunk]) -> str:
 
     # Group: pdf_name → page_no → chunks (order preserved because list is sorted)
     by_pdf: dict[str, dict[int, list[CitedChunk]]] = {}
+    first_chunk_per_pdf: dict[str, CitedChunk] = {}
     for cc in cited_chunks:
         by_pdf.setdefault(cc.pdf_name, {}).setdefault(cc.page_no, []).append(cc)
+        first_chunk_per_pdf.setdefault(cc.pdf_name, cc)
 
     for pdf_name, pages in by_pdf.items():
         lines.append(f"# {pdf_name}\n")
+        meta_block = _paper_meta_block(first_chunk_per_pdf[pdf_name].lc_doc.metadata)
+        if meta_block:
+            lines.append(meta_block + "\n")
         for page_no in sorted(pages):
             lines.append(f"## page {page_no}\n")
             for cc in pages[page_no]:
@@ -172,6 +186,7 @@ def highlight_sources(
     cited_nums: set[int],
     doc_store: dict[str, Path],
     *,
+    num_labels: dict[int, int] | None = None,
     color: str = "blue",
     label_bg: str = "blue",
     label_fg: str = "white",
@@ -183,17 +198,35 @@ def highlight_sources(
     least one cited source.
     """
     active = [cc for cc in cited_chunks if cc.num in cited_nums]
-
-    # (doc_hash, page_no) → list of (citation_num, prov)
-    page_entries: dict[tuple[str, int], list[tuple[int, object]]] = {}
-    for cc in active:
-        meta = DocMeta.model_validate(cc.lc_doc.metadata["dl_meta"])
-        for doc_item in meta.doc_items:
-            for prov in doc_item.prov or []:
-                key = (cc.doc_hash, prov.page_no)
-                page_entries.setdefault(key, []).append((cc.num, prov))
+    print(f"  [grounding] active chunks: {len(active)}  cited_nums={sorted(cited_nums)}")
 
     dl_docs: dict[str, DoclingDocument] = {}
+
+    # (doc_hash, page_no) → list of (citation_num, prov)
+    # Look up bounding boxes by finding the item via self_ref in the docling document.
+    page_entries: dict[tuple[str, int], list[tuple[int, object]]] = {}
+    for cc in active:
+        print(f"  [grounding] cc.num={cc.num}  doc_hash={cc.doc_hash!r}  self_ref={cc.docling_id!r}  in_store={cc.doc_hash in doc_store}")
+        if not cc.doc_hash or cc.doc_hash not in doc_store:
+            continue
+        if cc.doc_hash not in dl_docs:
+            dl_docs[cc.doc_hash] = DoclingDocument.load_from_json(doc_store[cc.doc_hash])
+        dl_doc = dl_docs[cc.doc_hash]
+        self_ref = cc.lc_doc.metadata.get("self_ref", "")
+        matched = False
+        for item, _ in dl_doc.iterate_items():
+            if getattr(item, "self_ref", "") == self_ref:
+                matched = True
+                prov_list = getattr(item, "prov", []) or []
+                print(f"  [grounding]   matched item  prov_count={len(prov_list)}")
+                for prov in prov_list:
+                    key = (cc.doc_hash, prov.page_no)
+                    page_entries.setdefault(key, []).append((cc.num, prov))
+                break
+        if not matched:
+            print(f"  [grounding]   no item matched self_ref={self_ref!r}")
+
+    print(f"  [grounding] page_entries keys: {list(page_entries.keys())}")
     font = _load_font(18)
     annotated: list[Image.Image] = []
 
@@ -204,6 +237,9 @@ def highlight_sources(
             dl_docs[doc_hash] = DoclingDocument.load_from_json(doc_store[doc_hash])
 
         page = dl_docs[doc_hash].pages[page_no]
+        if not page.image or not page.image.pil_image:
+            print(f"  [grounding] no image data for page {page_no} in {doc_hash}")
+            continue
         img = page.image.pil_image.copy()
         draw = ImageDraw.Draw(img)
         padding = line_width + 2
@@ -220,7 +256,8 @@ def highlight_sources(
             draw.rectangle(xy=bbox.as_tuple(), outline=color, width=line_width)
 
             # Draw citation label badge above the top-left corner
-            label = f"[{citation_num}]"
+            display_num = num_labels[citation_num] if num_labels and citation_num in num_labels else citation_num
+            label = f"[{display_num}]"
             try:
                 tb = draw.textbbox((0, 0), label, font=font)
                 tw, th = tb[2] - tb[0], tb[3] - tb[1]
@@ -267,13 +304,23 @@ def ask(
     messages = PROMPT.format_messages(context=context_md, input=question)
     answer: str = llm.invoke(messages).content
 
-    # 5. Extract which citation numbers were actually used
-    cited_nums = _extract_cited_nums(answer)
-    print(f"  Citations used in answer: {sorted(cited_nums)}")
+    # 5. Extract which citation numbers were actually used (in order of first appearance)
+    cited_in_order = list(dict.fromkeys(int(m) for m in re.findall(r"\[(\d+)\]", answer)))
+    remap = {old: new for new, old in enumerate(cited_in_order, start=1)}
 
-    # 6. Render bounding boxes only for cited chunks, labelled with [N]
+    # Rewrite [N] → [1], [2], ... in order of first appearance in the answer text
+    answer = re.sub(r"\[(\d+)\]", lambda m: f"[{remap.get(int(m.group(1)), int(m.group(1)))}]", answer)
+
+    original_cited_nums = set(cited_in_order)
+    print(f"  Citations used in answer: {sorted(remap.values())}")
+
+    # 6. Render bounding boxes only for cited chunks, labelled with sequential [N]
     output_dir.mkdir(parents=True, exist_ok=True)
-    images = highlight_sources(cited_chunks, cited_nums, doc_store)
+
+    report = f"# Question\n\n{question}\n\n# Context\n\n{context_md}\n\n# Answer\n\n{answer}\n"
+    (output_dir / "context.md").write_text(report, encoding="utf-8")
+    print(f"  Context saved: {output_dir / 'context.md'}")
+    images = highlight_sources(cited_chunks, original_cited_nums, doc_store, num_labels=remap)
     for i, img in enumerate(images):
         out = output_dir / f"grounding_{i}.png"
         img.save(out)

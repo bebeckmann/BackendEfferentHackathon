@@ -9,11 +9,10 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.types.doc import DocItemLabel
+from docling_core.types.doc import DocItemLabel, ImageRefMode
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -97,16 +96,25 @@ def summarize_document(client: OpenAI, doc: Any) -> str:
     _log_block("summarize", "result", summary)
     return summary
 
-# ── Title extraction ──────────────────────────────────────────────────────────
+# ── Paper metadata extraction ─────────────────────────────────────────────────
 
-def extract_title(client: OpenAI, doc: Any) -> str:
-    """Send the first two page images to the vision LLM and return the paper title."""
+_METADATA_SCHEMA = (
+    '{"title": "", "authors": [], "year": null, "journal": "", '
+    '"doi": "", "abstract": "", "keywords": [], "language": "", "document_type": ""}'
+)
+
+def extract_paper_metadata(client: OpenAI, doc: Any) -> dict[str, Any]:
+    """Send the first two page images to the vision LLM and return structured paper metadata."""
     user_content: list[Any] = [
         {
             "type": "text",
             "text": (
-                "Extract the title of this academic paper from the page image(s). "
-                "Return only the title — no quotes, no explanation."
+                "Extract metadata from this academic paper. "
+                "Return a JSON object with exactly these fields:\n"
+                f"{_METADATA_SCHEMA}\n"
+                "Rules: use null for missing fields; "
+                "authors and keywords must be arrays of strings; "
+                "year must be an integer or null."
             ),
         }
     ]
@@ -128,16 +136,40 @@ def extract_title(client: OpenAI, doc: Any) -> str:
         })
 
     model = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-4o-mini")
-    _log("title", f"model={model}  page_images={len(user_content) - 1}")
+    _log("metadata", f"model={model}  page_images={len(user_content) - 1}")
 
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": user_content}],
-        max_tokens=80,
+        messages=[
+            {
+                "role": "system",
+                "content": "You extract academic paper metadata. Respond with valid JSON only, no markdown fences.",
+            },
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=500,
     )
-    title = response.choices[0].message.content.strip()
-    _log("title", f"extracted: {title!r}")
-    return title
+    raw = response.choices[0].message.content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        _log("metadata", f"JSON parse failed: {raw[:200]}")
+        meta = {}
+
+    result: dict[str, Any] = {
+        "title":         meta.get("title") or "",
+        "authors":       meta.get("authors") or [],
+        "year":          meta.get("year"),
+        "journal":       meta.get("journal") or "",
+        "doi":           meta.get("doi") or "",
+        "abstract":      meta.get("abstract") or "",
+        "keywords":      meta.get("keywords") or [],
+        "language":      meta.get("language") or "",
+        "document_type": meta.get("document_type") or "",
+    }
+    _log("metadata", f"title={result['title']!r}  year={result['year']}  authors={result['authors']}")
+    return result
 
 
 # ── Surrounding-paragraph context ─────────────────────────────────────────────
@@ -279,7 +311,6 @@ def index(
     """
     doc_store_dir.mkdir(parents=True, exist_ok=True)
     converter = make_converter()
-    chunker = HybridChunker()
     openrouter = make_openrouter_client()
 
     manifest: dict[str, str] = {}
@@ -297,73 +328,81 @@ def index(
         )
         _log("convert", f"pages={page_count}  pictures={picture_count}  hash={str(dl_doc.origin.binary_hash)[:12]}…")
 
-        json_path = doc_store_dir / f"{dl_doc.origin.binary_hash}.json"
-        dl_doc.save_as_json(json_path)
+        doc_hash = str(dl_doc.origin.binary_hash)
+        json_path = doc_store_dir / f"{doc_hash}.json"
+        dl_doc.save_as_json(json_path, image_mode=ImageRefMode.EMBEDDED)
         _log("convert", f"doc JSON saved → {json_path}")
-        manifest[dl_doc.origin.binary_hash] = str(json_path)
+        manifest[doc_hash] = str(json_path)
 
         print(flush=True)
         _log("summarize", f"summarizing {source.name}…")
         doc_summary = summarize_document(openrouter, dl_doc)
 
         print(flush=True)
-        _log("title", f"extracting title from {source.name}…")
-        paper_title = extract_title(openrouter, dl_doc)
+        _log("metadata", f"extracting paper metadata from {source.name}…")
+        paper_meta = extract_paper_metadata(openrouter, dl_doc)
 
         print(flush=True)
         ordered, ref_to_idx = build_context_index(dl_doc)
 
-        # self_ref → PictureItem for authoritative get_image() access
-        pictures: dict[str, Any] = {
-            item.self_ref: item
-            for item, _ in dl_doc.iterate_items()
-            if getattr(item, "label", None) == DocItemLabel.PICTURE
-            and getattr(item, "self_ref", "")
-        }
-        _log("context-index", f"picture lookup built  entries={len(pictures)}")
-
         print(flush=True)
-        all_chunks = list(chunker.chunk(dl_doc))
-        text_chunks = sum(
-            1 for c in all_chunks
-            if not any(getattr(di, "label", None) == DocItemLabel.PICTURE for di in c.meta.doc_items)
-        )
-        image_chunks = len(all_chunks) - text_chunks
-        _log("chunk", f"total={len(all_chunks)}  text={text_chunks}  image={image_chunks}")
+        current_heading: str | None = None
+        text_count = image_count = 0
 
-        for i, chunk in enumerate(all_chunks):
-            picture_doc_items = [
-                di for di in chunk.meta.doc_items
-                if getattr(di, "label", None) == DocItemLabel.PICTURE
-            ]
+        for item, _ in dl_doc.iterate_items():
+            label = getattr(item, "label", None)
+            prov_list = getattr(item, "prov", []) or []
+            page_nos = sorted({p.page_no for p in prov_list})
 
-            if picture_doc_items:
-                pic_ref = getattr(picture_doc_items[0], "self_ref", "")
-                pic_item = pictures.get(pic_ref, picture_doc_items[0])
+            if label == DocItemLabel.SECTION_HEADER:
+                current_heading = getattr(item, "text", "") or ""
+
+            if label == DocItemLabel.PICTURE:
+                pic_ref = getattr(item, "self_ref", "")
                 context = surrounding_paragraphs(ordered, ref_to_idx, pic_ref)
                 print(flush=True)
-                _log("image", f"chunk {i+1}/{len(all_chunks)}  ref={pic_ref!r}")
+                _log("image", f"ref={pic_ref!r}  pages={page_nos}")
                 page_content = describe_image(
                     client=openrouter,
-                    picture_item=pic_item,
+                    picture_item=item,
                     doc=dl_doc,
                     document_summary=doc_summary,
                     context=context,
                 )
+                image_count += 1
             else:
-                page_content = chunk.text
-                headings = chunk.meta.headings or []
-                _log("chunk", f"chunk {i+1}/{len(all_chunks)}  chars={len(page_content)}  headings={headings}")
+                text = getattr(item, "text", "") or ""
+                if not text.strip():
+                    continue
+                page_content = text
+                _log("chunk", f"label={label}  chars={len(page_content)}  heading={current_heading!r}  pages={page_nos}")
+                text_count += 1
 
             lc_docs.append(
                 Document(
                     page_content=page_content,
                     metadata={
-                        "dl_meta": chunk.meta.model_dump(mode="json"),
-                        "paper_title": paper_title,
+                        # paper-level fields
+                        "paper_title":         paper_meta["title"],
+                        "paper_authors":       paper_meta["authors"],
+                        "paper_year":          paper_meta["year"],
+                        "paper_journal":       paper_meta["journal"],
+                        "paper_doi":           paper_meta["doi"],
+                        "paper_abstract":      paper_meta["abstract"],
+                        "paper_keywords":      paper_meta["keywords"],
+                        "paper_language":      paper_meta["language"],
+                        "paper_document_type": paper_meta["document_type"],
+                        # chunk-level fields
+                        "label":    label.value if hasattr(label, "value") else str(label),
+                        "heading":  current_heading,
+                        "page_nos": page_nos,
+                        "self_ref": getattr(item, "self_ref", ""),
+                        "doc_hash": str(dl_doc.origin.binary_hash),
                     },
                 )
             )
+
+        _log("chunk", f"total={text_count + image_count}  text={text_count}  image={image_count}")
 
     manifest_path = doc_store_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
