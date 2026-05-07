@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "docling>=2.92.0",
+    "fastapi>=0.136.1",
     "fastembed>=0.8.0",
     "langchain>=1.2.17",
     "langchain-openai>=1.2.1",
@@ -13,4 +14,5 @@ dependencies = [
     "langchain-qdrant>=1.1.0",
     "python-dotenv>=1.0.0",
     "qdrant-client>=1.17.1",
+    "uvicorn>=0.46.0",
 ]

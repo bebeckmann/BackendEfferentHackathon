@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from operator import itemgetter
 from pathlib import Path
@@ -282,9 +283,13 @@ def ask(
     chain: tuple,
     doc_store: dict[str, Path],
     *,
-    output_dir: Path = Path("."),
-) -> str:
-    """Run structured RAG: sort chunks → markdown context → cited answer → grounding."""
+    output_dir: Path | None = None,
+) -> tuple[str, list[Image.Image]]:
+    """Run structured RAG: sort chunks → markdown context → cited answer → grounding.
+
+    Returns (answer, grounding_images). If output_dir is given the report and
+    images are also saved to disk.
+    """
     retrieval_chain, llm = chain
 
     # 1. Retrieve context documents
@@ -304,28 +309,73 @@ def ask(
     messages = PROMPT.format_messages(context=context_md, input=question)
     answer: str = llm.invoke(messages).content
 
-    # 5. Extract which citation numbers were actually used (in order of first appearance)
+    # 5. Renumber citations [N] → [1], [2], ... in order of first appearance
     cited_in_order = list(dict.fromkeys(int(m) for m in re.findall(r"\[(\d+)\]", answer)))
     remap = {old: new for new, old in enumerate(cited_in_order, start=1)}
-
-    # Rewrite [N] → [1], [2], ... in order of first appearance in the answer text
     answer = re.sub(r"\[(\d+)\]", lambda m: f"[{remap.get(int(m.group(1)), int(m.group(1)))}]", answer)
-
     original_cited_nums = set(cited_in_order)
     print(f"  Citations used in answer: {sorted(remap.values())}")
 
-    # 6. Render bounding boxes only for cited chunks, labelled with sequential [N]
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    report = f"# Question\n\n{question}\n\n# Context\n\n{context_md}\n\n# Answer\n\n{answer}\n"
-    (output_dir / "context.md").write_text(report, encoding="utf-8")
-    print(f"  Context saved: {output_dir / 'context.md'}")
+    # 6. Render grounding images
     images = highlight_sources(cited_chunks, original_cited_nums, doc_store, num_labels=remap)
-    for i, img in enumerate(images):
-        out = output_dir / f"grounding_{i}.png"
-        img.save(out)
-        print(f"  Grounding image saved: {out}")
 
+    # 7. Optionally persist to disk
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report = f"# Question\n\n{question}\n\n# Context\n\n{context_md}\n\n# Answer\n\n{answer}\n"
+        (output_dir / "context.md").write_text(report, encoding="utf-8")
+        print(f"  Context saved: {output_dir / 'context.md'}")
+        for i, img in enumerate(images):
+            out = output_dir / f"grounding_{i}.png"
+            img.save(out)
+            print(f"  Grounding image saved: {out}")
+
+    return answer, images
+
+
+# ── LangChain tool ───────────────────────────────────────────────────────────
+
+from langchain_core.tools import tool  # noqa: E402
+
+_rag_cache: dict = {}
+_rag_lock = threading.Lock()
+
+
+def _get_rag() -> tuple:
+    """Lazily initialise and cache the RAG chain + doc store."""
+    if _rag_cache:
+        return _rag_cache["chain"], _rag_cache["doc_store"]
+    with _rag_lock:
+        if _rag_cache:
+            return _rag_cache["chain"], _rag_cache["doc_store"]
+        api_key = os.environ["OPENROUTER_API_KEY"]
+        embeddings = OpenAIEmbeddings(
+            model=os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small"),
+            api_key=api_key,
+            base_url=OPENROUTER_BASE,
+            dimensions=EMBED_DIM,
+        )
+        qdrant = QdrantClient(path=QDRANT_PATH)
+        vector_store = QdrantVectorStore(
+            client=qdrant,
+            collection_name=COLLECTION,
+            embedding=embeddings,
+        )
+        _rag_cache["chain"] = build_chain(vector_store)
+        _rag_cache["doc_store"] = load_doc_store()
+        return _rag_cache["chain"], _rag_cache["doc_store"]
+
+
+@tool
+def search_literature(question: str) -> str:
+    """Search the indexed scientific literature and return a cited answer.
+
+    Use this tool whenever the question requires looking up facts, findings,
+    methods, or conclusions from the ingested research papers.
+    Input should be a plain-language question.
+    """
+    chain, doc_store = _get_rag()
+    answer, _ = ask(question, chain, doc_store)
     return answer
 
 
@@ -352,7 +402,7 @@ if __name__ == "__main__":
     try:
         question = "Why was it important to test Sepsis-3 definitions outside high-income countries?"
         print(f"\nQ: {question}")
-        answer = ask(question, chain, doc_store, output_dir=Path("notebook/grounding_output"))
+        answer, _ = ask(question, chain, doc_store, output_dir=Path("grounding_output"))
         print(f"\nA: {answer}")
     finally:
         client.close()
