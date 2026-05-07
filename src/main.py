@@ -13,8 +13,18 @@ from src.storage import save_uploaded_images
 
 load_dotenv()
 
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "http://localhost:8000"
+)
+
+FRONTEND_ORIGINS = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:3000,https://www.sepsis-analysis.online,https://sepsis-analysis.online"
+).split(",")
+
+FRONTEND_ORIGINS = [origin.strip() for origin in FRONTEND_ORIGINS if origin.strip()]
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -27,7 +37,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
