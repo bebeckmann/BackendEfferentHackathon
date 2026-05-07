@@ -235,6 +235,7 @@ def ask(
     resp = chain.invoke({"input": question})
     answer: str = resp["answer"]
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     images = highlight_sources(resp["context"], doc_store)
     for i, img in enumerate(images):
         out = output_dir / f"grounding_{i}.png"
@@ -253,5 +254,5 @@ if __name__ == "__main__":
 
     question = "What are the main findings about sepsis treatment?"
     print(f"\nQ: {question}")
-    answer = ask(question, chain, doc_store)
+    answer = ask(question, chain, doc_store, output_dir=Path("grounding_output"))
     print(f"\nA: {answer}")
