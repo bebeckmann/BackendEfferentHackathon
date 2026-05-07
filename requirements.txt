@@ -1,0 +1,7 @@
+langchain
+langchain_core
+langchain_classic
+requests
+python-dotenv
+langchain-community
+wikipedia
