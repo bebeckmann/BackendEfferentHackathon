@@ -14,7 +14,6 @@ from langchain_classic.agents import AgentExecutor, create_react_agent
 
 class OpenRouterLLM(LLM):
     model: str = "openai/gpt-4o-mini"
-    api_key: str
     url: str = "https://openrouter.ai/api/v1/chat/completions"
 
     @property
@@ -29,7 +28,7 @@ class OpenRouterLLM(LLM):
         **kwargs,
     ) -> str:
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer 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",
             "Content-Type": "application/json",
         }
 
@@ -105,10 +104,7 @@ def reverse_text(text: str) -> str:
 # ----------------------------
 
 def main():
-    api_key = "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"
-
     llm = OpenRouterLLM(
-        api_key=api_key,
         model="openai/gpt-4o-mini",
     )
 
