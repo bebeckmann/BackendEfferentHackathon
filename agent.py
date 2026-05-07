@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_openrouter import ChatOpenRouter
 
 from retrieve import search_literature
@@ -19,10 +20,17 @@ llm = ChatOpenRouter(
 agent = create_agent(
     model=llm,
     tools=[search_literature],
+    middleware=[
+        ToolCallLimitMiddleware(
+            tool_name="search_literature",
+            thread_limit=None,
+            run_limit=1,
+        )
+    ],
     system_prompt=(
         "You are a research assistant with access to a scientific literature database. "
-        "Use the search_literature tool to look up information before answering. "
-        "Always cite the sources returned by the tool in your final answer."
+        "Use the search_literature tool to look up information before answering."
+        "Foreward the answer UNCHANGED to the user from the retrieved literature"
     ),
 )
 

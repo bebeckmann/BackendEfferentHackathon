@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from operator import itemgetter
 from pathlib import Path
 
+import base64 as _base64
+
 from PIL import Image, ImageDraw, ImageFont
 from docling.datamodel.document import DoclingDocument
 from dotenv import load_dotenv
@@ -166,6 +168,22 @@ def build_chain(vector_store: QdrantVectorStore) -> tuple:
 
 # ── Visual grounding ──────────────────────────────────────────────────────────
 
+def _pil_from_page_image(page_image) -> Image.Image | None:
+    """Return a PIL image from a Docling PageItem.image, decoding base64 if needed."""
+    if page_image is None:
+        return None
+    if page_image.pil_image is not None:
+        return page_image.pil_image
+    uri = str(page_image.uri) if getattr(page_image, "uri", None) else None
+    if uri and uri.startswith("data:"):
+        try:
+            _, b64_data = uri.split(",", 1)
+            return Image.open(io.BytesIO(_base64.b64decode(b64_data)))
+        except Exception:
+            return None
+    return None
+
+
 def _load_font(size: int = 18) -> ImageFont.ImageFont:
     for path in [
         "/System/Library/Fonts/Helvetica.ttc",
@@ -238,10 +256,11 @@ def highlight_sources(
             dl_docs[doc_hash] = DoclingDocument.load_from_json(doc_store[doc_hash])
 
         page = dl_docs[doc_hash].pages[page_no]
-        if not page.image or not page.image.pil_image:
+        pil_img = _pil_from_page_image(page.image)
+        if pil_img is None:
             print(f"  [grounding] no image data for page {page_no} in {doc_hash}")
             continue
-        img = page.image.pil_image.copy()
+        img = pil_img.copy()
         draw = ImageDraw.Draw(img)
         padding = line_width + 2
 
@@ -322,15 +341,12 @@ def ask(
     # 7. Optionally persist to disk
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        report = f"# Question\n\n{question}\n\n# Context\n\n{context_md}\n\n# Answer\n\n{answer}\n"
-        (output_dir / "context.md").write_text(report, encoding="utf-8")
-        print(f"  Context saved: {output_dir / 'context.md'}")
         for i, img in enumerate(images):
             out = output_dir / f"grounding_{i}.png"
             img.save(out)
             print(f"  Grounding image saved: {out}")
 
-    return answer, images
+    return answer, images, cited_chunks
 
 
 # ── LangChain tool ───────────────────────────────────────────────────────────
@@ -339,6 +355,18 @@ from langchain_core.tools import tool  # noqa: E402
 
 _rag_cache: dict = {}
 _rag_lock = threading.Lock()
+
+# Images produced by the most recent search_literature call, keyed by thread id
+# so concurrent requests don't overwrite each other.
+_images_by_thread: dict[int, list] = {}
+_images_dict_lock = threading.Lock()
+
+
+def pop_last_images() -> list:
+    """Retrieve and clear images stored for the calling thread."""
+    tid = threading.get_ident()
+    with _images_dict_lock:
+        return _images_by_thread.pop(tid, [])
 
 
 def _get_rag() -> tuple:
@@ -368,15 +396,29 @@ def _get_rag() -> tuple:
 
 @tool
 def search_literature(question: str) -> str:
-    """Search the indexed scientific literature and return a cited answer.
+    """Search the indexed scientific literature and return a cited markdown answer.
 
     Use this tool whenever the question requires looking up facts, findings,
     methods, or conclusions from the ingested research papers.
     Input should be a plain-language question.
     """
     chain, doc_store = _get_rag()
-    answer, _ = ask(question, chain, doc_store)
-    return answer
+    answer, images, cited_chunks = ask(question, chain, doc_store)
+
+    # Store images so the API layer can retrieve them after the agent finishes.
+    tid = threading.get_ident()
+    with _images_dict_lock:
+        _images_by_thread[tid] = list(images)
+
+    cited_nums = {int(m) for m in re.findall(r"\[(\d+)\]", answer)}
+    sources = "\n".join(
+        f"**[{cc.num}]** {cc.pdf_name}"
+        + (f" ({cc.lc_doc.metadata.get('paper_year')})" if cc.lc_doc.metadata.get("paper_year") else "")
+        + f" — page {cc.page_no}"
+        for cc in cited_chunks
+        if cc.num in cited_nums
+    )
+    return f"{answer}\n\n---\n**Sources**\n\n{sources}"
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -402,7 +444,7 @@ if __name__ == "__main__":
     try:
         question = "Why was it important to test Sepsis-3 definitions outside high-income countries?"
         print(f"\nQ: {question}")
-        answer, _ = ask(question, chain, doc_store, output_dir=Path("grounding_output"))
+        answer, _, _chunks = ask(question, chain, doc_store, output_dir=Path("grounding_output"))
         print(f"\nA: {answer}")
     finally:
         client.close()
