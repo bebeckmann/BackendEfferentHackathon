@@ -6,7 +6,6 @@ import io
 import os
 import shutil
 import tempfile
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -18,16 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import agent
 from index import index as run_index, read_index_entries
 from retrieve import (
     _get_rag,
+    ask,
     delete_all_documents,
     delete_document,
     find_doc_hash_by_title,
     invalidate_rag_cache,
     list_indexed_documents,
-    pop_last_images,
 )
 
 load_dotenv()
@@ -125,15 +123,9 @@ async def chat(
     """
     _ = session_id, images  # accepted for API compatibility, unused by RAG pipeline
 
-    thread_id = session_id or str(uuid.uuid4())
-
     def _run(question: str):
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": question}]},
-            config={"configurable": {"thread_id": thread_id}},
-        )
-        answer = result["messages"][-1].content
-        grounding_images = pop_last_images()  # set by search_literature if called
+        chain, doc_store = _get_rag()
+        answer, grounding_images, _ = ask(question, chain, doc_store)
         return answer, grounding_images
 
     try:
